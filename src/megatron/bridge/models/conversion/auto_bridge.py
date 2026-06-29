@@ -32,7 +32,6 @@ if TYPE_CHECKING:
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
-from modelopt.torch.quantization.utils import is_quantized
 from safetensors.torch import save_file
 from transformers.configuration_utils import PretrainedConfig
 from typing_extensions import Unpack
@@ -651,7 +650,8 @@ class AutoBridge(Generic[MegatronModelT]):
 
         Args:
             model: Megatron model instance or list of instances.
-            quant_mode: ModelOpt quantization mode to export. Currently supports ``"nvfp4"``.
+            quant_mode: ModelOpt quantization mode to export. Currently supports
+                ``"nvfp4"`` and ``"w4a16_nvfp4"``.
             cpu: Whether to move exported tensors to CPU before yielding.
             show_progress: Display progress bar during base Hugging Face weight export.
             conversion_tasks: Pre-built conversion tasks. If not provided, tasks will be built
@@ -671,9 +671,10 @@ class AutoBridge(Generic[MegatronModelT]):
                 ``quant_mode``.
         """
         from megatron.bridge.models.conversion.modelopt_utils import (
-            build_hf_to_megatron_name_map,
+            build_hf_modelopt_quant_metadata,
             collect_modelopt_quant_metadata,
             get_modelopt_quant_exporter,
+            is_modelopt_quantizable_weight_name,
             matches_quant_ignore_pattern,
             sync_modelopt_quant_metadata,
         )
@@ -685,12 +686,25 @@ class AutoBridge(Generic[MegatronModelT]):
         if conversion_tasks is None:
             conversion_tasks = self._model_bridge.build_conversion_tasks(self.hf_pretrained, model)
 
-        hf_to_megatron_name = build_hf_to_megatron_name_map(conversion_tasks)
         metadata = collect_modelopt_quant_metadata(conversion_tasks)
 
-        pp_group = model_bridge._get_pp_group(model)
-        if pp_group is not None and dist.is_initialized() and dist.get_world_size(group=pp_group) > 1:
-            sync_modelopt_quant_metadata(metadata, pp_group)
+        if dist.is_initialized():
+            synced_group_ids: set[int] = set()
+            for group in (
+                model_bridge._get_pp_group(model),
+                model_bridge._get_ep_group(model),
+            ):
+                if group is None or id(group) in synced_group_ids:
+                    continue
+                synced_group_ids.add(id(group))
+                if dist.get_world_size(group=group) > 1:
+                    sync_modelopt_quant_metadata(metadata, group)
+
+        if ignore_patterns is None:
+            ignore_patterns = []
+
+        mapping_registry = None
+        hf_metadata = build_hf_modelopt_quant_metadata(conversion_tasks, metadata)
 
         hf_weights = self.export_hf_weights(
             model,
@@ -700,16 +714,24 @@ class AutoBridge(Generic[MegatronModelT]):
             merge_adapter_weights=merge_adapter_weights,
         )
 
-        ignore_patterns = ignore_patterns or []
         for hf_name, tensor in hf_weights:
             if "_quantizer." in hf_name:
                 continue
 
             meta = None
-            if hf_name.endswith(".weight") and not matches_quant_ignore_pattern(hf_name, ignore_patterns):
-                megatron_name = hf_to_megatron_name.get(hf_name)
-                if megatron_name is not None:
-                    meta = metadata.get(megatron_name)
+            if is_modelopt_quantizable_weight_name(
+                hf_name,
+            ) and not matches_quant_ignore_pattern(
+                hf_name,
+                ignore_patterns,
+            ):
+                meta = hf_metadata.get(hf_name)
+                if meta is None and metadata:
+                    if mapping_registry is None:
+                        mapping_registry = self._model_bridge.mapping_registry()
+                    mapping = mapping_registry.hf_to_megatron_lookup(hf_name)
+                    if mapping is not None:
+                        meta = metadata.get(mapping.megatron_param)
 
             if meta is None:
                 tensor = tensor.detach()
@@ -1086,6 +1108,10 @@ class AutoBridge(Generic[MegatronModelT]):
         )
         model_instance = self._get_model_instance(model)
         quant_tensors = None
+        # Import lazily so Bridge conversion modules can load before ModelOpt
+        # registers its Megatron-Bridge plugin hooks.
+        from modelopt.torch.quantization.utils import is_quantized
+
         if is_quantized(model_instance):
             quant_tensors = {}
 
